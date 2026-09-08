@@ -1,0 +1,548 @@
+#include <torch/extension.h>
+#include <ATen/xpu/XPUContext.h>
+#include <sycl/sycl.hpp>
+
+template<typename T>
+void index_add_kernel_wrapper(
+    sycl::queue my_queue,
+    T* input,
+    T* output,
+    int* indices,
+    size_t S, size_t C, size_t E){
+        my_queue.submit([&](sycl::handler& h) {
+            h.parallel_for(
+                sycl::range<2>(C, E), [=](sycl::id<2> idx) {
+                    int c = idx[0];
+                    int e = idx[1];
+                    int final_index = indices[c] * E + e;
+                    output[final_index] += input[c * E + e];
+                }
+            );
+        });
+}
+
+at::Tensor index_add_op(
+        at::Tensor input_pt, 
+        at::Tensor output_pt, 
+        at::Tensor indices_pt){
+
+    // Get shape info
+    auto input_shape = input_pt.sizes();
+    auto output_shape = output_pt.sizes();
+
+    // Get configuration
+    auto C = input_shape[0];
+    auto E = input_shape[1];
+    auto S = output_shape[0];
+
+    // Get queue
+    auto q = c10::xpu::getCurrentXPUStream().queue();
+
+    if(input_pt.scalar_type() == at::kFloat){
+        auto input = (float*) input_pt.data_ptr();
+        auto output = (float*) output_pt.data_ptr();
+        auto indices = (int*) indices_pt.data_ptr();
+        index_add_kernel_wrapper(q, input, output, indices, S, C, E);
+    }else{
+        auto input = (at::BFloat16*) input_pt.data_ptr();
+        auto output = (at::BFloat16*) output_pt.data_ptr();
+        auto indices = (int*) indices_pt.data_ptr();
+        index_add_kernel_wrapper(q, input, output, indices, S, C, E);
+    }
+    
+    return output_pt;
+}
+
+template<typename T>
+auto index_gather_kernel_wrapper(
+    sycl::queue my_queue,
+    T* input,
+    int* indices,
+    T* output,
+    size_t I, size_t O, size_t E){
+        my_queue.submit([&](sycl::handler& h) {
+            h.parallel_for(
+                sycl::range<2>(O, E), [=](sycl::id<2> idx) {
+                    int o = idx[0];
+                    int e = idx[1];
+                    int final_index = indices[o] * E + e;
+                    output[o * E + e] = input[final_index];
+                }
+            );
+        }); 
+}
+
+at::Tensor index_gather(
+        at::Tensor input_pt, 
+        at::Tensor indices_pt,
+        at::Tensor output_pt
+        ){
+
+    // Get shape info
+    auto input_shape = input_pt.sizes();
+    auto output_shape = output_pt.sizes();
+
+    // Get configuration
+    auto I = input_shape[0];
+    auto E = input_shape[1];
+    auto O = output_shape[0];
+
+    // Get queue
+    auto q = c10::xpu::getCurrentXPUStream().queue();
+
+    if(input_pt.scalar_type() == at::kFloat){
+        auto input = (float*) input_pt.data_ptr();
+        auto output = (float*) output_pt.data_ptr();
+        auto indices = (int*) indices_pt.data_ptr();
+        index_gather_kernel_wrapper(q, input, indices, output, I, O, E);
+    }else{
+        auto input = (at::BFloat16*) input_pt.data_ptr();
+        auto output = (at::BFloat16*) output_pt.data_ptr();
+        auto indices = (int*) indices_pt.data_ptr();
+        index_gather_kernel_wrapper(q, input, indices, output, I, O, E);
+    }
+    
+    return output_pt;
+}
+
+template<typename Ti>
+void compute_partial_token_counts_wrapper(
+    sycl::queue my_queue,
+    Ti* selected_experts,
+    int* partial_token_counts,
+    int* expert_counts_ep,
+    int expert_start_idx, int expert_end_idx,
+    size_t K, size_t TB, size_t TH){
+    
+    my_queue.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::range<1>(TH), [=](sycl::id<1> idx) {
+                auto tid = idx[0];
+                for(int lt = 0; lt < TB; lt++) {
+                    int expert_count = 0;
+                    auto t = tid * TB + lt;
+                    for(int k = 0; k < K; k++) {
+                        auto n = selected_experts[t * K + k];
+                        if(n >= expert_start_idx && n < expert_end_idx){
+                            partial_token_counts[(n-expert_start_idx) * TH + tid] += 1;
+                            expert_count += 1;
+                        }
+                    }
+                    expert_counts_ep[t] = expert_count;
+                }
+            }
+        );
+    });
+}
+
+at::Tensor compute_partial_token_counts(
+        at::Tensor selected_experts_pt, 
+        at::Tensor partial_token_counts_pt,
+        at::Tensor expert_counts_ep_pt,
+        int expert_start_idx,
+        int expert_end_idx
+    ){
+
+    // Get shape info
+    auto selected_experts_shape = selected_experts_pt.sizes();
+    auto partial_token_counts_shape = partial_token_counts_pt.sizes();
+
+    // Get configuration
+    auto T = selected_experts_shape[0];
+    auto K = selected_experts_shape[1];
+    auto TH = partial_token_counts_shape[1];
+    auto TB = int(T / TH);
+
+    // Get queue
+    auto my_queue = c10::xpu::getCurrentXPUStream().queue();
+
+    // Launch kernel
+    if(selected_experts_pt.scalar_type() == at::kLong) {
+        auto selected_experts = (long*) selected_experts_pt.data_ptr();
+        auto partial_token_counts = (int*) partial_token_counts_pt.data_ptr();
+        auto expert_counts_ep = (int*) expert_counts_ep_pt.data_ptr();
+        compute_partial_token_counts_wrapper(my_queue, selected_experts, partial_token_counts, expert_counts_ep, expert_start_idx, expert_end_idx, K, TB, TH);
+    }else{
+        auto selected_experts = (int*) selected_experts_pt.data_ptr();
+        auto partial_token_counts = (int*) partial_token_counts_pt.data_ptr();
+        auto expert_counts_ep = (int*) expert_counts_ep_pt.data_ptr();
+        compute_partial_token_counts_wrapper(my_queue, selected_experts, partial_token_counts, expert_counts_ep, expert_start_idx, expert_end_idx, K, TB, TH);
+    }
+
+    return partial_token_counts_pt;
+}
+
+template<typename Ti>
+void compute_input_and_output_indices_wrapper(
+    sycl::queue my_queue,
+    Ti* selected_experts,
+    int* partial_cum_token_counts,
+    int* input_increment_buffer,
+    int* cum_expert_counts_ep,
+    int* selected_experts_indices,
+    int* input_indices,
+    int* output_indices,
+    int expert_start_idx, int expert_end_idx,
+    size_t K, size_t TB, size_t TH){
+
+    my_queue.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::range<1>(TH), [=](sycl::id<1> idx) {
+                auto tid = idx[0];
+                for(int t=(tid*TB); t < (tid+1)*TB; t++) {
+                    int output_index = cum_expert_counts_ep[t];
+                    for(int k = 0; k < K; k++) {
+                        auto n = selected_experts[t * K + k];
+                        if(n >= expert_start_idx && n < expert_end_idx){
+                            auto ln = n - expert_start_idx;   
+                            auto base = partial_cum_token_counts[ln * TH + tid];
+                            auto offset = input_increment_buffer[ln * TH + tid];
+                            auto input_index = base + offset;
+
+                            input_indices[input_index] = t;
+                            input_increment_buffer[ln * TH + tid] = offset + 1;
+
+                            output_indices[output_index] = input_index;
+                            selected_experts_indices[output_index] = k;
+                            output_index += 1;
+                        }
+                    }
+                }
+            }
+        );
+    });
+
+}
+
+void compute_input_and_output_indices(
+    at::Tensor selected_experts_pt,
+    at::Tensor partial_cum_token_counts_pt,
+    at::Tensor input_increment_buffer_pt,
+    at::Tensor cum_expert_counts_ep_pt,
+    at::Tensor selected_experts_indices_pt,
+    at::Tensor input_indices_pt,
+    at::Tensor output_indices_pt,
+    int expert_start_idx, 
+    int expert_end_idx
+){
+    // Get shape info
+    auto selected_experts_shape = selected_experts_pt.sizes();
+    auto input_increment_buffer_pt_shape = input_increment_buffer_pt.sizes();
+
+    // Provided variables
+    auto T = selected_experts_shape[0];
+    auto K = selected_experts_shape[1];
+    auto N = input_increment_buffer_pt_shape[0];
+    auto TH = input_increment_buffer_pt_shape[1];
+
+    // Derivative variables
+    auto TB = int(T / TH);
+
+    // Get queue
+    auto my_queue = c10::xpu::getCurrentXPUStream().queue();
+    
+    // Launch kernel
+    if(selected_experts_pt.scalar_type() == at::kLong) {
+        auto selected_experts = (long*) selected_experts_pt.data_ptr();
+        auto partial_cum_token_counts = (int*) partial_cum_token_counts_pt.data_ptr();
+        auto input_increment_buffer = (int*) input_increment_buffer_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto selected_experts_indices = (int*) selected_experts_indices_pt.data_ptr();
+        auto input_indices = (int*) input_indices_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+
+        compute_input_and_output_indices_wrapper(my_queue,
+            selected_experts, partial_cum_token_counts, 
+            input_increment_buffer,
+            cum_expert_counts_ep,
+            selected_experts_indices,
+            input_indices, output_indices,
+            expert_start_idx, expert_end_idx,
+            K, TB, TH);
+    }else{
+        auto selected_experts = (int*) selected_experts_pt.data_ptr();
+        auto partial_cum_token_counts = (int*) partial_cum_token_counts_pt.data_ptr();
+        auto input_increment_buffer = (int*) input_increment_buffer_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto selected_experts_indices = (int*) selected_experts_indices_pt.data_ptr();
+        auto input_indices = (int*) input_indices_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+
+        compute_input_and_output_indices_wrapper(my_queue,
+            selected_experts, partial_cum_token_counts, 
+            input_increment_buffer,
+            cum_expert_counts_ep,
+            selected_experts_indices,
+            input_indices, output_indices,
+            expert_start_idx, expert_end_idx,
+            K, TB, TH);
+    }
+}
+
+template<typename Tx>
+void reduce_ggemm_output_wrapper(
+    sycl::queue my_queue,
+    Tx* ggemm_output,
+    Tx* routing_weights,
+    int* cum_expert_counts_ep,
+    int* selected_experts_indices,
+    int* output_indices,
+    Tx* final_hidden_states,
+    size_t T, size_t K, size_t E,
+    bool skip_weights_scaling){
+
+    my_queue.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::range<2>(T,E), [=](sycl::id<2> idx) {
+                int t = idx[0];
+                int e = idx[1];
+                float acc = 0.0;
+                for(int i = cum_expert_counts_ep[t]; i < cum_expert_counts_ep[t+1]; i++){
+                    auto k = selected_experts_indices[i];
+                    auto index = output_indices[i];
+                    float scaling = skip_weights_scaling ? 1.0f : static_cast<float>(routing_weights[t * K + k]);
+                    float output = static_cast<float>(ggemm_output[index * E + e]);
+                    acc += (output * scaling);
+                }
+                final_hidden_states[t * E + e] = acc;
+            }
+        );
+    });
+
+}
+
+void reduce_ggemm_output(
+    at::Tensor ggemm_output_pt,
+    at::Tensor routing_weights_pt,
+    at::Tensor cum_expert_counts_ep_pt,
+    at::Tensor selected_experts_indices_pt,
+    at::Tensor output_indices_pt,
+    at::Tensor final_hidden_states_pt,
+    bool skip_weights_scaling = false){  
+
+    // Configuration
+    auto T = routing_weights_pt.sizes()[0];
+    auto K = routing_weights_pt.sizes()[1];
+    auto E = ggemm_output_pt.sizes()[1];
+
+    // Queue
+    auto my_queue = c10::xpu::getCurrentXPUStream().queue();
+
+    if(ggemm_output_pt.scalar_type() == at::kFloat){
+        auto ggemm_output = (float*) ggemm_output_pt.data_ptr();
+        auto routing_weights = (float*) routing_weights_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto selected_experts_indices = (int*) selected_experts_indices_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+        auto final_hidden_states = (float*) final_hidden_states_pt.data_ptr();
+        reduce_ggemm_output_wrapper(my_queue, 
+            ggemm_output, 
+            routing_weights, 
+            cum_expert_counts_ep, 
+            selected_experts_indices, 
+            output_indices, 
+            final_hidden_states, 
+            T, K, E, skip_weights_scaling);
+    }else{
+        auto ggemm_output = (at::BFloat16*) ggemm_output_pt.data_ptr();
+        auto routing_weights = (at::BFloat16*) routing_weights_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto selected_experts_indices = (int*) selected_experts_indices_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+        auto final_hidden_states = (at::BFloat16*) final_hidden_states_pt.data_ptr();
+        reduce_ggemm_output_wrapper(my_queue, 
+            ggemm_output, 
+            routing_weights, 
+            cum_expert_counts_ep, 
+            selected_experts_indices, 
+            output_indices, 
+            final_hidden_states, 
+            T, K, E, skip_weights_scaling);
+    }
+}
+
+template<typename Tx>
+void reduce_ggem_output_backward_wrapper(
+    sycl::queue my_queue,
+    Tx* final_hidden_states_grad,
+    Tx* ggemm_output,
+    Tx* routing_weights,
+    int* cum_expert_counts_ep,
+    int* selected_experts_indices,
+    int* input_indices,
+    int* output_indices,
+    Tx* ggemm_output_grad,
+    Tx* routing_weights_grad,
+    size_t RT, size_t T, size_t K, size_t E){
+
+    my_queue.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::range<1>(RT), [=](sycl::id<1> idx) {
+                int rt = idx[0];
+                auto index = output_indices[rt];
+                auto t = input_indices[index];
+                auto k = selected_experts_indices[rt];
+                float weight_grad_acc = 0.0;
+                for(int e=0; e < E; e++){
+                    float scaling = static_cast<float>(routing_weights[t * K + k]);
+                    float output_grad = static_cast<float>(final_hidden_states_grad[t * E + e]);
+                    float input = static_cast<float>(ggemm_output[index * E + e]);
+
+                    ggemm_output_grad[index * E + e] = scaling * output_grad;
+                    weight_grad_acc += input * output_grad;
+                }
+                routing_weights_grad[t * K + k] = weight_grad_acc;
+            }
+        );
+    });
+
+    /*
+    my_queue.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::range<1>(T), [=](sycl::id<1> idx) {
+                int t = idx[0];
+                for(int i=cum_expert_counts_ep[t]; i < cum_expert_counts_ep[t+1]; i++){
+                    auto index = output_indices[i];
+                    auto k = selected_experts_indices[i];
+                    
+                    float weight_grad_acc = 0.0;
+                    for(int e=0; e < E; e++){
+                        float scaling = static_cast<float>(routing_weights[t * K + k]);
+                        float output_grad = static_cast<float>(final_hidden_states_grad[t * E + e]);
+                        float input = static_cast<float>(ggemm_output[index * E + e]);
+
+                        ggemm_output_grad[index * E + e] = scaling * output_grad;
+                        weight_grad_acc += input * output_grad;
+                    }
+                    routing_weights_grad[t * K + k] = weight_grad_acc;
+                }
+            }
+        );
+    });
+    */
+}
+
+void reduce_ggemm_output_backward(
+    at::Tensor final_hidden_states_grad_pt,
+    at::Tensor ggemm_output_pt,
+    at::Tensor routing_weights_pt,
+    at::Tensor cum_expert_counts_ep_pt,
+    at::Tensor selected_experts_indices_pt,
+    at::Tensor input_indices_pt,
+    at::Tensor output_indices_pt,
+    at::Tensor ggemm_output_grad_pt,
+    at::Tensor routing_weights_grad_pt){  
+    
+    // Configuration
+    auto RT = ggemm_output_pt.sizes()[0];
+    auto T = routing_weights_pt.sizes()[0];
+    auto K = routing_weights_pt.sizes()[1];
+    auto E = ggemm_output_pt.sizes()[1];
+    
+    // Queue
+    auto my_queue = c10::xpu::getCurrentXPUStream().queue();
+
+    if(ggemm_output_pt.scalar_type() == at::kFloat){
+        auto final_hidden_states_grad = (float*) final_hidden_states_grad_pt.data_ptr();
+        auto ggemm_output = (float*) ggemm_output_pt.data_ptr();
+        auto routing_weights = (float*) routing_weights_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto selected_experts_indices = (int*) selected_experts_indices_pt.data_ptr();
+        auto input_indices = (int*) input_indices_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+        auto ggemm_output_grad = (float*) ggemm_output_grad_pt.data_ptr();
+        auto routing_weights_grad = (float*) routing_weights_grad_pt.data_ptr();
+        reduce_ggem_output_backward_wrapper(my_queue,
+            final_hidden_states_grad, ggemm_output, routing_weights, cum_expert_counts_ep, selected_experts_indices, input_indices, output_indices, 
+            ggemm_output_grad, routing_weights_grad,
+            RT, T, K, E);
+    }else{
+        auto final_hidden_states_grad = (at::BFloat16*) final_hidden_states_grad_pt.data_ptr();
+        auto ggemm_output = (at::BFloat16*) ggemm_output_pt.data_ptr();
+        auto routing_weights = (at::BFloat16*) routing_weights_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto selected_experts_indices = (int*) selected_experts_indices_pt.data_ptr();
+        auto input_indices = (int*) input_indices_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+        auto ggemm_output_grad = (at::BFloat16*) ggemm_output_grad_pt.data_ptr();
+        auto routing_weights_grad = (at::BFloat16*) routing_weights_grad_pt.data_ptr();
+        reduce_ggem_output_backward_wrapper(my_queue,
+            final_hidden_states_grad, ggemm_output, routing_weights, cum_expert_counts_ep, selected_experts_indices, input_indices, output_indices, 
+            ggemm_output_grad, routing_weights_grad,
+            RT, T, K, E);
+    }
+
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+template<typename Tx>
+void shuffle_sub_matrix_reduce_wrapper(
+    sycl::queue my_queue,
+    Tx* ggemm_input_grad,
+    int* cum_expert_counts_ep,
+    int* output_indices,
+    Tx* hidden_states_grad,
+    size_t T, size_t E, size_t K){
+
+    my_queue.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::range<2>(T,E), [=](sycl::id<2> idx) {
+                int t = idx[0];
+                int e = idx[1];
+                float acc = 0.0;
+                for(int i=cum_expert_counts_ep[t]; i < cum_expert_counts_ep[t+1]; i++){  
+                    auto index = output_indices[i];
+                    float output = static_cast<float>(ggemm_input_grad[index * E + e]);
+                    acc += output;
+                }
+                hidden_states_grad[t * E + e] = acc;
+            }
+        );
+    });
+
+}
+
+void shuffle_sub_matrix_reduce(
+    at::Tensor ggemm_input_grad_pt,
+    at::Tensor cum_expert_counts_ep_pt,
+    at::Tensor output_indices_pt,
+    at::Tensor hidden_states_grad_pt){
+
+    // Configuration
+    auto T = hidden_states_grad_pt.sizes()[0];
+    auto E = hidden_states_grad_pt.sizes()[1];
+    auto NT = ggemm_input_grad_pt.sizes()[0];
+
+    // Queue
+    auto my_queue = c10::xpu::getCurrentXPUStream().queue();
+
+    if(ggemm_input_grad_pt.scalar_type() == at::kFloat){
+        auto ggemm_input_grad = (float*) ggemm_input_grad_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+        auto hidden_states_grad = (float*) hidden_states_grad_pt.data_ptr();
+        shuffle_sub_matrix_reduce_wrapper(my_queue, ggemm_input_grad, cum_expert_counts_ep, output_indices, hidden_states_grad, T, E, NT);
+    }else{
+        auto ggemm_input_grad = (at::BFloat16*) ggemm_input_grad_pt.data_ptr();
+        auto cum_expert_counts_ep = (int*) cum_expert_counts_ep_pt.data_ptr();
+        auto output_indices = (int*) output_indices_pt.data_ptr();
+        auto hidden_states_grad = (at::BFloat16*) hidden_states_grad_pt.data_ptr();
+        shuffle_sub_matrix_reduce_wrapper(my_queue, ggemm_input_grad, cum_expert_counts_ep, output_indices, hidden_states_grad, T, E, NT);
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("index_add_op", &index_add_op, "Index Add Operation");
+    m.def("compute_partial_token_counts", &compute_partial_token_counts, "Compute Partial Token Counts");
+    m.def("compute_input_and_output_indices", &compute_input_and_output_indices, "Compute Input and Output Indices");
+
+    m.def("index_gather", &index_gather, "Gather Operation");
+    m.def("shuffle_sub_matrix_reduce", &shuffle_sub_matrix_reduce, "Shuffle Sub Matrix Reduce Operation");
+
+    m.def("reduce_ggemm_output", &reduce_ggemm_output, "Combine Tokens Operation");
+    m.def("reduce_ggemm_output_backward", &reduce_ggemm_output_backward, "Combine Tokens Operation Backward");
+}

@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -N LLM-pretraining-1Trillion
+#PBS -q prod
+#PBS -l select=256:ncpus=208
+#PBS -l walltime=06:00:00
+#PBS -l filesystems=flare
+
+cd $PBS_O_WORKDIR
+
+# Environment
+module load frameworks
+source fastmoe/bin/activate
+source setenv_aurora_essential.sh
+
+PAPER=1 NUM_NODES=192 USE_OM_CACHED_MODEL=1 MODEL_CHOICE=deepseek-ai/DeepSeek-V3--N264-L96 DATASET_CHOICE=allenai/OLMoE-mix-0924 TOKENIZER=deepseek EP=12 PP=24 BATCH_SIZE=24 PP_SCHEME=1f1b ENABLE_SAC=1 SAC_LEVEL=7 USE_OM_PGSHARDED_OPTIMIZER=1 bash run_experiment.sh

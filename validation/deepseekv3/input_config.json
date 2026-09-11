@@ -1,0 +1,8 @@
+{
+    "batch_size": 2,
+    "sequence_length": 4,
+    "dtype": "float32",
+    "device": "cpu",
+    "test_only_forward": false,
+    "layer_idx" : 4
+}

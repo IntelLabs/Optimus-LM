@@ -1,0 +1,24 @@
+{
+    "analysis_choice" : 0,
+
+    "analysis0": {
+        "about" : "Optimus pretraining run",
+        "exp_info_list": [
+
+        ],
+        "num_logs" : null,
+        "end_tokens" : null,
+        "start_step" : null,
+        "end_step"   : null,
+        "min_loss" : null,
+        "max_loss" : null,
+        "skip_label" : false,
+        "plot_dir" : ".",
+        "label_inside_plot" : false,
+        "other" : [
+            
+        ]
+    }
+}
+
+

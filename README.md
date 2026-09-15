@@ -66,6 +66,8 @@ bash launch_dist.sh 8 256 python scripts/generate_shards.py --num_files 2903 --m
 ```
 # Get single node (Change -A appropriately)
 qsub -l select=1 -l walltime=01:00:00 -A Intel-Aurora -q debug -I -l filesystems=flare
+module load frameworks
+source setenv_aurora_essential.sh
 
 # Run
 EXIT_STEPS=32 MODEL_CHOICE=allenai/OLMo-1B-hf DATASET_CHOICE=allenai/OLMoE-mix-0924 USE_OM_SHARDED_OPTIMIZER=1 bash run_experiment.sh
